@@ -3,8 +3,18 @@
 ###########
 
 terraform {
-  required_version = ">= 1.0.0"
+  required_version = ">= 1.0.7"
   backend "remote" {}
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 3.49.0"
+    }
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = ">= 0.2.0"
+    }
+  }
 }
 
 provider "aws" {
@@ -13,6 +23,16 @@ provider "aws" {
 }
 
 provider "aws" {
+  alias  = "secondary"
+  region = var.sec_region
+}
+
+provider "awscc" {
+  alias  = "primary"
+  region = var.region
+}
+
+provider "awscc" {
   alias  = "secondary"
   region = var.sec_region
 }
@@ -46,7 +66,6 @@ data "aws_rds_engine_version" "family" {
 data "aws_iam_policy_document" "monitoring_rds_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["monitoring.rds.amazonaws.com"]
@@ -55,6 +74,44 @@ data "aws_iam_policy_document" "monitoring_rds_assume_role" {
 }
 
 data "aws_partition" "current" {}
+
+data "aws_caller_identity" "current" {}
+
+data "aws_iam_policy_document" "aurora" {
+  statement {
+    sid       = "Allow all grants for the KMS key to root"
+    actions   = ["kms:*"]
+    resources = ["*"]
+    principals {
+      type = "AWS"
+      identifiers = [
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
+        data.aws_caller_identity.current.arn,
+      ]
+    }
+  }
+
+  statement {
+    sid = "Allow use of the KMS key to RDS service"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey",
+      "kms:CreateGrant",
+      "kms:ListGrants"
+    ]
+    resources = ["*"]
+    principals {
+      type = "Service"
+      identifiers = [
+        "monitoring.rds.amazonaws.com",
+        "rds.amazonaws.com",
+      ]
+    }
+  }
+}
 
 #########################
 # Create Unique password
@@ -92,22 +149,28 @@ resource "aws_db_subnet_group" "private_s" {
 # KMS
 ###########
 
-resource "aws_kms_key" "kms_p" {
-  provider    = aws.primary
-  count       = var.storage_encrypted ? 1 : 0
-  description = "KMS key for Aurora Storage Encryption"
-  tags        = var.tags
+resource "awscc_kms_key" "kms_p" {
+  provider            = awscc.primary
+  count               = var.storage_encrypted ? 1 : 0
+  key_policy          = data.aws_iam_policy_document.aurora.json
+  description         = "KMS key for Aurora Storage Encryption"
+  enable_key_rotation = false
+  enabled             = true
+  tags                = local.tags_as_list
   # following causes terraform destroy to fail. But this is needed so that Aurora encrypted snapshots can be restored for your production workload.
   lifecycle {
     prevent_destroy = true
   }
 }
 
-resource "aws_kms_key" "kms_s" {
-  provider    = aws.secondary
-  count       = var.setup_globaldb && var.storage_encrypted ? 1 : 0
-  description = "KMS key for Aurora Storage Encryption"
-  tags        = var.tags
+resource "awscc_kms_key" "kms_s" {
+  provider            = awscc.secondary
+  count               = var.setup_globaldb && var.storage_encrypted ? 1 : 0
+  key_policy          = data.aws_iam_policy_document.aurora.json
+  description         = "KMS key for Aurora Storage Encryption"
+  enable_key_rotation = false
+  enabled             = true
+  tags                = local.tags_as_list
   # following causes terraform destroy to fail. But this is needed so that Aurora encrypted snapshots can be restored for your production workload.
   lifecycle {
     prevent_destroy = true
@@ -118,12 +181,14 @@ resource "aws_kms_key" "kms_s" {
 # IAM
 ###########
 
-resource "aws_iam_role" "rds_enhanced_monitoring" {
-  description         = "IAM Role for RDS Enhanced monitoring"
-  path                = "/"
-  assume_role_policy  = data.aws_iam_policy_document.monitoring_rds_assume_role.json
-  managed_policy_arns = ["arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"]
-  tags                = var.tags
+resource "awscc_iam_role" "rds_enhanced_monitoring" {
+  provider                    = awscc.primary
+  description                 = "IAM Role for RDS Enhanced monitoring"
+  path                        = "/"
+  assume_role_policy_document = data.aws_iam_policy_document.monitoring_rds_assume_role.json
+  managed_policy_arns         = ["arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"]
+  max_session_duration        = 3600
+  tags                        = local.tags_as_list
 }
 
 #############
@@ -131,18 +196,19 @@ resource "aws_iam_role" "rds_enhanced_monitoring" {
 #############
 
 # Aurora Global DB 
-resource "aws_rds_global_cluster" "globaldb" {
+resource "awscc_rds_global_cluster" "globaldb" {
   count                     = var.setup_globaldb ? 1 : 0
-  provider                  = aws.primary
+  provider                  = awscc.primary
   global_cluster_identifier = "${var.identifier}-globaldb"
   engine                    = var.engine
   engine_version            = var.engine == "aurora-postgresql" ? var.engine_version_pg : var.engine_version_mysql
   storage_encrypted         = var.storage_encrypted
+  deletion_protection       = false
 }
 
 resource "aws_rds_cluster" "primary" {
   provider                        = aws.primary
-  global_cluster_identifier       = var.setup_globaldb ? aws_rds_global_cluster.globaldb[0].id : null
+  global_cluster_identifier       = var.setup_globaldb ? awscc_rds_global_cluster.globaldb[0].id : null
   cluster_identifier              = "${var.identifier}-${var.region}"
   engine                          = var.engine
   engine_version                  = var.engine == "aurora-postgresql" ? var.engine_version_pg : var.engine_version_mysql
@@ -156,7 +222,7 @@ resource "aws_rds_cluster" "primary" {
   backup_retention_period         = var.backup_retention_period
   preferred_backup_window         = var.preferred_backup_window
   storage_encrypted               = var.storage_encrypted
-  kms_key_id                      = var.storage_encrypted ? aws_kms_key.kms_p[0].arn : null
+  kms_key_id                      = var.storage_encrypted ? awscc_kms_key.kms_p[0].arn : null
   apply_immediately               = true
   skip_final_snapshot             = var.skip_final_snapshot
   final_snapshot_identifier       = var.skip_final_snapshot ? null : "${var.final_snapshot_identifier_prefix}-${var.identifier}-${var.region}-${md5(timestamp())}"
@@ -188,7 +254,7 @@ resource "aws_rds_cluster_instance" "primary" {
   db_parameter_group_name      = aws_db_parameter_group.aurora_db_parameter_group_p.id
   performance_insights_enabled = true
   monitoring_interval          = var.monitoring_interval
-  monitoring_role_arn          = aws_iam_role.rds_enhanced_monitoring.arn
+  monitoring_role_arn          = awscc_iam_role.rds_enhanced_monitoring.arn
   apply_immediately            = true
   tags                         = var.tags
 }
@@ -197,7 +263,7 @@ resource "aws_rds_cluster_instance" "primary" {
 resource "aws_rds_cluster" "secondary" {
   count                           = var.setup_globaldb ? 1 : 0
   provider                        = aws.secondary
-  global_cluster_identifier       = aws_rds_global_cluster.globaldb[0].id
+  global_cluster_identifier       = awscc_rds_global_cluster.globaldb[0].id
   cluster_identifier              = "${var.identifier}-${var.sec_region}"
   engine                          = var.engine
   engine_version                  = var.engine == "aurora-postgresql" ? var.engine_version_pg : var.engine_version_mysql
@@ -208,7 +274,7 @@ resource "aws_rds_cluster" "secondary" {
   backup_retention_period         = var.backup_retention_period
   preferred_backup_window         = var.preferred_backup_window
   source_region                   = var.storage_encrypted ? var.region : null
-  kms_key_id                      = var.storage_encrypted ? aws_kms_key.kms_s[0].arn : null
+  kms_key_id                      = var.storage_encrypted ? awscc_kms_key.kms_s[0].arn : null
   apply_immediately               = true
   skip_final_snapshot             = var.skip_final_snapshot
   final_snapshot_identifier       = var.skip_final_snapshot ? null : "${var.final_snapshot_identifier_prefix}-${var.identifier}-${var.sec_region}-${md5(timestamp())}"
@@ -240,7 +306,7 @@ resource "aws_rds_cluster_instance" "secondary" {
   db_parameter_group_name      = aws_db_parameter_group.aurora_db_parameter_group_s[0].id
   performance_insights_enabled = true
   monitoring_interval          = var.monitoring_interval
-  monitoring_role_arn          = aws_iam_role.rds_enhanced_monitoring.arn
+  monitoring_role_arn          = awscc_iam_role.rds_enhanced_monitoring.arn
   apply_immediately            = true
   tags                         = var.tags
 }

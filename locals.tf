@@ -1,4 +1,6 @@
 locals {
+  tags_as_list           = [for k, v in var.tags : { key = k, value = v }]
+
   apg_cluster_pgroup_params = [{
     name         = "rds.force_autovacuum_logging_level"
     value        = "warning"
